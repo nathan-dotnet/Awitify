@@ -1,0 +1,34 @@
+{
+  "expo": {
+    "name": "Awitify",
+    "slug": "awitify",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "scheme": "awitify",
+    "android": {
+      "package": "com.awitify.player",
+      "permissions": [
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+        "WAKE_LOCK"
+      ],
+      "edgeToEdgeEnabled": true
+    },
+    "plugins": [
+      [
+        "expo-audio",
+        {
+          "enableBackgroundPlayback": true
+        }
+      ],
+      "expo-document-picker",
+      "expo-sqlite",
+      "expo-font",
+      "expo-asset"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
