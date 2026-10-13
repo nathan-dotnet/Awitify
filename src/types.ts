@@ -1,3 +1,4 @@
+
 export type Track = {
   id: string;
   title: string;
@@ -7,5 +8,12 @@ export type Track = {
   duration?: number;
   liked: boolean;
   addedAt: number;
+  source?: 'local' | 'online';
+  artworkUri?: string | null;
 };
-export type TabName = 'Home' | 'Search' | 'Library' | 'Settings';
+
+export type TabName =
+  | 'Home'
+  | 'Search'
+  | 'Library'
+  | 'Settings';
