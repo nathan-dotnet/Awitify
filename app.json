@@ -3,6 +3,7 @@
     "name": "Awitify",
     "slug": "awitify",
     "version": "1.0.0",
+    "newArchEnabled": true,
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "scheme": "awitify",
