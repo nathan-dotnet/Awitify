@@ -1,8 +1,13 @@
+
 import TrackPlayer, { PlayerCommand } from "@rntp/player";
 import { registerRootComponent } from "expo";
 
 TrackPlayer.registerPlaybackSession(() => {
-  TrackPlayer.setupPlayer();
+  TrackPlayer.setupPlayer({
+    progressSync: {
+      intervalSeconds: 1,
+    },
+  });
 
   TrackPlayer.setCommands({
     capabilities: [

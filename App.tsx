@@ -38,7 +38,7 @@ const dbPromise = SQLite.openDatabaseAsync("awitify.db");
 const fmt = (seconds = 0) =>
   `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
 const initials = (title: string) =>
-  title.trim().slice(0, 1).toUpperCase() || "â™ª";
+  title.trim().slice(0, 1).toUpperCase() || "♫";
 
 export default function App() {
   const [tracks, setTracks] = useState<AppTrack[]>([]);
@@ -155,6 +155,7 @@ export default function App() {
     }
   }, []);
 
+
   useEffect(() => {
     const playingSub = TrackPlayer.addEventListener(
       Event.IsPlayingChanged,
@@ -169,26 +170,11 @@ export default function App() {
       },
     );
 
-    useEffect(() => {
-      if (!playing) return;
-
-      const interval = setInterval(() => {
-        try {
-          const progress = TrackPlayer.getProgress();
-
-          setCurrentTime(progress.position);
-          setDuration(progress.duration);
-        } catch (error) {
-          console.warn("Failed to update playback progress:", error);
-        }
-      }, 500);
-
-      return () => clearInterval(interval);
-    }, [playing]);
     const transitionSub = TrackPlayer.addEventListener(
       Event.MediaItemTransition,
       (event) => {
         const id = event.item?.mediaId;
+
         if (id) {
           setCurrentId(id);
           setQueueIndex(event.index);
@@ -202,6 +188,7 @@ export default function App() {
       transitionSub.remove();
     };
   }, []);
+
 
   useEffect(() => {
     (async () => {
@@ -512,7 +499,7 @@ export default function App() {
           {item.title}
         </Text>
         <Text numberOfLines={1} style={styles.trackMeta}>
-          {item.artist} Â· {item.album}
+          {item.artist} · {item.album}
         </Text>
       </View>
       <Pressable
@@ -774,7 +761,7 @@ export default function App() {
                           {album.name}
                         </Text>
                         <Text style={styles.trackMeta} numberOfLines={1}>
-                          Album Â· {album.artist} Â· {album.songs.length} songs
+                          Album · {album.artist} · {album.songs.length} songs
                         </Text>
                       </View>
                       <Ionicons
@@ -828,7 +815,7 @@ export default function App() {
                           <View style={{ flex: 1 }}>
                             <Text style={styles.trackTitle}>{artist}</Text>
                             <Text style={styles.trackMeta}>
-                              {artistAlbums.length} albums Â·{" "}
+                              {artistAlbums.length} albums ·{" "}
                               {artistSongs.length} songs
                             </Text>
                           </View>
@@ -875,7 +862,7 @@ export default function App() {
                                   {albumTrack.album || "Unknown Album"}
                                 </Text>
                                 <Text style={styles.trackMeta}>
-                                  Album Â· {albumSongs.length} songs
+                                  Album · {albumSongs.length} songs
                                 </Text>
                               </View>
                             </Pressable>
@@ -943,8 +930,8 @@ export default function App() {
             }
             subtitle={
               selectedAlbum
-                ? `${albumTracks.length} songs Â· ${albumTracks[0]?.artist ?? "Unknown Artist"}`
-                : `${localTracks.length} songs Â· ${libraryAlbums.length} albums`
+                ? `${albumTracks.length} songs · ${albumTracks[0]?.artist ?? "Unknown Artist"}`
+                : `${localTracks.length} songs · ${libraryAlbums.length} albums`
             }
           />
 
@@ -1036,7 +1023,7 @@ export default function App() {
                     {album.name}
                   </Text>
                   <Text numberOfLines={1} style={styles.trackMeta}>
-                    {album.artist} Â· {album.songs.length} songs
+                    {album.artist} · {album.songs.length} songs
                   </Text>
                 </Pressable>
               )}
@@ -1106,7 +1093,7 @@ export default function App() {
             </View>
           </View>
         </View>
-        <Text style={styles.version}>AWITIFY Â· VERSION 1.0.0</Text>
+        <Text style={styles.version}>AWITIFY · VERSION 1.0.0</Text>
       </ScrollView>
     );
   };
@@ -1305,8 +1292,8 @@ export default function App() {
             <Ionicons name="phone-portrait-outline" size={17} color={C.muted} />
             <Text style={styles.playerFooterText}>
               {current.source === "online"
-                ? "Online streaming Â· Internet required"
-                : "Local music Â· Available offline"}
+                ? "Online streaming · Internet required"
+                : "Local music · Available offline"}
             </Text>
             <View style={{ flex: 1 }} />
             <Pressable onPress={() => setExpandedQueue(!expandedQueue)}>
@@ -1319,7 +1306,7 @@ export default function App() {
         <View style={styles.busyOverlay}>
           <ActivityIndicator color={C.white} size="large" />
           <Text style={{ color: C.white, marginTop: 12 }}>
-            Importing your musicâ€¦
+            Importing your music…
           </Text>
         </View>
       )}
