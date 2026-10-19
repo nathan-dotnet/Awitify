@@ -1,6 +1,7 @@
 {
   "expo": {
     "name": "Awitify",
+    "icon": "./assets/app-icon.png",
     "slug": "awitify",
     "version": "1.0.0",
     "newArchEnabled": true,

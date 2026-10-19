@@ -49,6 +49,7 @@ export default function App() {
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [showPlayer, setShowPlayer] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [busyMessage, setBusyMessage] = useState("Importing your music…");
   const [queue, setQueue] = useState<string[]>([]);
   const [queueIndex, setQueueIndex] = useState(0);
   const [expandedQueue, setExpandedQueue] = useState(false);
@@ -95,10 +96,17 @@ export default function App() {
     [tracks],
   );
 
+  const likedTracks = useMemo(
+    () => localTracks.filter((track) => track.liked),
+    [localTracks],
+  );
+
+  const [showLikedSongs, setShowLikedSongs] = useState(false);
+
   const libraryAlbums = useMemo(() => {
     const groups = new Map<string, AppTrack[]>();
 
-    for (const track of tracks) {
+    for (const track of tracks.filter((item) => item.source !== "online")) {
       const albumName = track.album?.trim() || "Unknown Album";
       const artistName = track.artist?.trim() || "Unknown Artist";
       const key = `${artistName.toLowerCase()}::${albumName.toLowerCase()}`;
@@ -141,10 +149,18 @@ export default function App() {
         artworkUri: song.artworkUrl,
       }));
 
-      setTracks((previous) => [
-        ...onlineTracks,
-        ...previous.filter((track) => track.source !== "online"),
-      ]);
+      setTracks((previous) => {
+        const localTracks = previous.filter(
+          (track) => track.source !== "online",
+        );
+
+        const localIds = new Set(localTracks.map((track) => track.id));
+
+        return [
+          ...onlineTracks.filter((track) => !localIds.has(track.id)),
+          ...localTracks,
+        ];
+      });
     } catch (error) {
       console.error("Failed to load online songs:", error);
       setOnlineError(
@@ -154,7 +170,6 @@ export default function App() {
       setOnlineLoading(false);
     }
   }, []);
-
 
   useEffect(() => {
     const playingSub = TrackPlayer.addEventListener(
@@ -188,7 +203,6 @@ export default function App() {
       transitionSub.remove();
     };
   }, []);
-
 
   useEffect(() => {
     (async () => {
@@ -331,6 +345,198 @@ export default function App() {
       );
     } finally {
       setBusy(false);
+    }
+  };
+
+  const downloadSong = async (track: AppTrack) => {
+    if (track.source !== "online") {
+      Alert.alert(
+        "Already offline",
+        "This song is already stored on your device.",
+      );
+      return;
+    }
+
+    setBusyMessage("Downloading song…");
+    setBusy(true);
+
+    try {
+      const db = await dbPromise;
+      const id = track.id;
+      const directory = `${FileSystem.documentDirectory}music/`;
+      const dirInfo = await FileSystem.getInfoAsync(directory);
+
+      if (!dirInfo.exists) {
+        await FileSystem.makeDirectoryAsync(directory, {
+          intermediates: true,
+        });
+      }
+
+      const existing = await db.getFirstAsync<{ id: string }>(
+        "SELECT id FROM tracks WHERE id = ?",
+        id,
+      );
+
+      if (existing) {
+        Alert.alert(
+          "Already downloaded",
+          "This song is already in your offline library.",
+        );
+        return;
+      }
+
+      const destination = `${directory}${id.replace(/[^a-zA-Z0-9_-]/g, "_")}.mp3`;
+      const result = await FileSystem.downloadAsync(track.uri, destination);
+
+      const savedTrack: AppTrack = {
+        ...track,
+        uri: result.uri,
+        liked: true,
+        source: "local",
+      };
+
+      await db.runAsync(
+        "INSERT INTO tracks (id,title,artist,album,uri,duration,liked,addedAt) VALUES (?,?,?,?,?,?,?,?)",
+        savedTrack.id,
+        savedTrack.title,
+        savedTrack.artist,
+        savedTrack.album,
+        savedTrack.uri,
+        savedTrack.duration ?? null,
+        1,
+        Date.now(),
+      );
+
+      setTracks((previous) => [
+        savedTrack,
+        ...previous.filter((item) => item.id !== savedTrack.id),
+      ]);
+
+      Alert.alert(
+        "Downloaded",
+        `${savedTrack.title} is available offline and has been added to Liked Songs.`,
+      );
+    } catch (error) {
+      console.error("Song download failed:", error);
+      Alert.alert(
+        "Download failed",
+        "Please check your internet connection and try again.",
+      );
+    } finally {
+      setBusy(false);
+      setBusyMessage("Importing your music…");
+    }
+  };
+
+  const downloadAlbum = async (album: {
+    name: string;
+    artist: string;
+    songs: AppTrack[];
+  }) => {
+    const onlineSongs = album.songs.filter(
+      (track) => track.source === "online",
+    );
+
+    if (onlineSongs.length === 0) {
+      Alert.alert(
+        "Already offline",
+        "This album has no online songs to download.",
+      );
+      return;
+    }
+
+    if (busy) {
+      Alert.alert("Please wait", "Another music operation is in progress.");
+      return;
+    }
+
+    setBusyMessage(`Preparing ${album.name}…`);
+    setBusy(true);
+
+    let downloaded = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    try {
+      const db = await dbPromise;
+      const directory = `${FileSystem.documentDirectory}music/`;
+      const dirInfo = await FileSystem.getInfoAsync(directory);
+
+      if (!dirInfo.exists) {
+        await FileSystem.makeDirectoryAsync(directory, {
+          intermediates: true,
+        });
+      }
+
+      for (let i = 0; i < onlineSongs.length; i++) {
+        const track = onlineSongs[i];
+
+        setBusyMessage(
+          `Downloading album: ${i + 1} of ${onlineSongs.length}\n${track.title}`,
+        );
+
+        try {
+          const existing = await db.getFirstAsync<{ id: string }>(
+            "SELECT id FROM tracks WHERE id = ?",
+            track.id,
+          );
+
+          if (existing) {
+            skipped++;
+            continue;
+          }
+
+          const safeId = track.id.replace(/[^a-zA-Z0-9_-]/g, "_");
+          const destination = `${directory}${safeId}.mp3`;
+          const result = await FileSystem.downloadAsync(
+            track.uri,
+            destination,
+          );
+
+          const savedTrack: AppTrack = {
+            ...track,
+            uri: result.uri,
+            liked: true,
+            source: "local",
+          };
+
+          await db.runAsync(
+            "INSERT INTO tracks (id,title,artist,album,uri,duration,liked,addedAt) VALUES (?,?,?,?,?,?,?,?)",
+            savedTrack.id,
+            savedTrack.title,
+            savedTrack.artist,
+            savedTrack.album,
+            savedTrack.uri,
+            savedTrack.duration ?? null,
+            1,
+            Date.now(),
+          );
+
+          setTracks((previous) => [
+            savedTrack,
+            ...previous.filter((item) => item.id !== savedTrack.id),
+          ]);
+
+          downloaded++;
+        } catch (error) {
+          console.error(`Failed to download ${track.title}:`, error);
+          failed++;
+        }
+      }
+
+      Alert.alert(
+        "Album download finished",
+        `${album.name} by ${album.artist}\n\nDownloaded: ${downloaded}\nAlready downloaded: ${skipped}\nFailed: ${failed}`,
+      );
+    } catch (error) {
+      console.error("Album download failed:", error);
+      Alert.alert(
+        "Download failed",
+        "Could not download this album. Please try again.",
+      );
+    } finally {
+      setBusy(false);
+      setBusyMessage("Importing your music…");
     }
   };
 
@@ -517,6 +723,14 @@ export default function App() {
         hitSlop={10}
         onPress={() => {
           Alert.alert(item.title, "Song options", [
+            ...(item.source === "online"
+              ? [
+                  {
+                    text: "Download song",
+                    onPress: () => downloadSong(item),
+                  },
+                ]
+              : []),
             {
               text: "Play next",
               onPress: () => {
@@ -738,39 +952,53 @@ export default function App() {
                   </View>
 
                   {searchResults.albums.map((album) => (
-                    <Pressable
+                    <View
                       key={`${album.artist}-${album.name}`}
-                      onPress={() => {
-                        setSelectedAlbum(album.key);
-                        setTab("Library");
-                      }}
                       style={styles.trackRow}
                     >
-                      <View style={styles.coverSmall}>
-                        {album.artworkUri ? (
-                          <Image
-                            source={{ uri: album.artworkUri }}
-                            style={styles.coverImage}
-                          />
-                        ) : (
-                          <Ionicons name="albums" size={24} color={C.blue} />
-                        )}
-                      </View>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.trackTitle} numberOfLines={1}>
-                          {album.name}
-                        </Text>
-                        <Text style={styles.trackMeta} numberOfLines={1}>
-                          Album · {album.artist} · {album.songs.length} songs
-                        </Text>
-                      </View>
-                      <Ionicons
-                        name="chevron-forward"
-                        size={18}
-                        color={C.dim}
-                      />
-                    </Pressable>
+                      <Pressable
+                        onPress={() => {
+                          setSelectedAlbum(album.key);
+                          setTab("Library");
+                        }}
+                        style={{ flex: 1, flexDirection: "row", alignItems: "center" }}
+                      >
+                        <View style={styles.coverSmall}>
+                          {album.artworkUri ? (
+                            <Image
+                              source={{ uri: album.artworkUri }}
+                              style={styles.coverImage}
+                            />
+                          ) : (
+                            <Ionicons name="albums" size={24} color={C.blue} />
+                          )}
+                        </View>
+
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.trackTitle} numberOfLines={1}>
+                            {album.name}
+                          </Text>
+                          <Text style={styles.trackMeta} numberOfLines={1}>
+                            Album · {album.artist} · {album.songs.length} songs
+                          </Text>
+                        </View>
+                      </Pressable>
+
+                      <Pressable
+                        onPress={() => downloadAlbum(album)}
+                        disabled={busy}
+                        hitSlop={8}
+                        style={{ padding: 10, opacity: busy ? 0.5 : 1 }}
+                      >
+                        <Ionicons
+                          name="download-outline"
+                          size={22}
+                          color={C.blue}
+                        />
+                      </Pressable>
+                    </View>
                   ))}
+
                 </>
               )}
 
@@ -923,22 +1151,54 @@ export default function App() {
         <View style={{ flex: 1 }}>
           <Header
             title={
-              selectedAlbum
-                ? (libraryAlbums.find((album) => album.key === selectedAlbum)
-                    ?.name ?? "Album")
-                : "Your library"
+              showLikedSongs
+                ? "Liked Songs"
+                : selectedAlbum
+                  ? (libraryAlbums.find((album) => album.key === selectedAlbum)
+                      ?.name ?? "Album")
+                  : "Your library"
             }
             subtitle={
-              selectedAlbum
-                ? `${albumTracks.length} songs · ${albumTracks[0]?.artist ?? "Unknown Artist"}`
-                : `${localTracks.length} songs · ${libraryAlbums.length} albums`
+              showLikedSongs
+                ? `${likedTracks.length} liked songs`
+                : selectedAlbum
+                  ? `${albumTracks.length} songs · ${albumTracks[0]?.artist ?? "Unknown Artist"}`
+                  : `${localTracks.length} songs · ${libraryAlbums.length} albums`
             }
           />
-
+          {!selectedAlbum && !showLikedSongs && (
+            <Pressable
+              onPress={() => setShowLikedSongs(true)}
+              style={[
+                styles.settingsCard,
+                {
+                  marginHorizontal: 16,
+                  marginTop: 12,
+                  marginBottom: 12,
+                  flexDirection: "row",
+                  alignItems: "center",
+                },
+              ]}
+            >
+              <View style={[styles.settingIcon, { backgroundColor: C.blue }]}>
+                <Ionicons name="heart" size={22} color={C.white} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.settingTitle}>Liked Songs</Text>
+                <Text style={styles.settingText}>
+                  {likedTracks.length} songs · Available offline
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={20} color={C.muted} />
+            </Pressable>
+          )}
           <View style={styles.libraryActions}>
             {selectedAlbum ? (
               <Pressable
-                onPress={() => setSelectedAlbum(null)}
+                onPress={() => {
+                  setSelectedAlbum(null);
+                  setShowLikedSongs(false);
+                }}
                 style={styles.outlineButton}
               >
                 <Ionicons name="arrow-back" size={18} color={C.white} />
@@ -953,10 +1213,14 @@ export default function App() {
 
             <Pressable
               onPress={() => {
-                if (selectedAlbum && albumTracks.length) {
-                  playTrack(albumTracks[0], albumTracks);
-                } else if (tracks.length) {
-                  playTrack(tracks[0], tracks);
+                const playList = showLikedSongs
+                  ? likedTracks
+                  : selectedAlbum
+                    ? albumTracks
+                    : localTracks;
+
+                if (playList.length) {
+                  playTrack(playList[0], playList);
                 }
               }}
               style={styles.outlineButton}
@@ -966,22 +1230,22 @@ export default function App() {
             </Pressable>
           </View>
 
-          {selectedAlbum ? (
+          {showLikedSongs ? (
             <FlatList
-              data={albumTracks}
+              data={likedTracks}
               keyExtractor={(item) => item.id}
               renderItem={({ item, index }) => (
-                <TrackRow item={item} index={index} list={albumTracks} />
+                <TrackRow item={item} index={index} list={likedTracks} />
               )}
               contentContainerStyle={{ paddingBottom: 150 }}
               ListEmptyComponent={
                 <Empty
-                  title="Album not found"
-                  detail="Go back to your albums and select another album."
+                  title="No liked songs yet"
+                  detail="Download an online song or tap the heart on a local song to add it here."
                 />
               }
             />
-          ) : libraryAlbums.length ? (
+          ) : selectedAlbum ? (
             <FlatList
               key="album-grid"
               data={libraryAlbums}
@@ -1305,9 +1569,7 @@ export default function App() {
       {busy && (
         <View style={styles.busyOverlay}>
           <ActivityIndicator color={C.white} size="large" />
-          <Text style={{ color: C.white, marginTop: 12 }}>
-            Importing your music…
-          </Text>
+          <Text style={{ color: C.white, marginTop: 12 }}>{busyMessage}</Text>
         </View>
       )}
     </SafeAreaView>
