@@ -29,15 +29,17 @@
       "expo-document-picker",
       "expo-sqlite",
       "expo-font",
-      "expo-asset"
+      "expo-asset",
+      "@kesha-antonov/react-native-background-downloader"
     ],
     "experiments": {
       "typedRoutes": true
     },
     "extra": {
       "eas": {
-        "projectId": "294a042c-b442-43a0-a9ff-4688648a99e6"
+        "projectId": "2bdb72e4-02fd-40c7-8844-769a01998914"
       }
-    }
+    },
+    "owner": "nathan.expo"
   }
 }

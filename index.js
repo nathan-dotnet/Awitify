@@ -7,6 +7,9 @@ TrackPlayer.registerPlaybackSession(() => {
     progressSync: {
       intervalSeconds: 1,
     },
+    android: {
+      taskRemovedBehavior: "stop",
+    },
   });
 
   TrackPlayer.setCommands({

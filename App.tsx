@@ -1,5 +1,11 @@
 ﻿import { Ionicons } from "@expo/vector-icons";
-import TrackPlayer, { Event, type MediaItem } from "@rntp/player";
+import {
+  completeHandler,
+  createDownloadTask,
+  directories,
+  setConfig,
+} from "@kesha-antonov/react-native-background-downloader";
+import TrackPlayer, { Event, RepeatMode, type MediaItem } from "@rntp/player";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import * as SQLite from "expo-sqlite";
@@ -18,6 +24,7 @@ import {
   Image,
   Keyboard,
   Pressable,
+  RefreshControl,
   ScrollView,
   StatusBar,
   Text,
@@ -38,7 +45,7 @@ const dbPromise = SQLite.openDatabaseAsync("awitify.db");
 const fmt = (seconds = 0) =>
   `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
 const initials = (title: string) =>
-  title.trim().slice(0, 1).toUpperCase() || "♫";
+  title.trim().slice(0, 1).toUpperCase() || "♪";
 
 export default function App() {
   const [tracks, setTracks] = useState<AppTrack[]>([]);
@@ -49,12 +56,26 @@ export default function App() {
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [showPlayer, setShowPlayer] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [busyMessage, setBusyMessage] = useState("Importing your music…");
+  const [busyMessage, setBusyMessage] = useState("Importing your music...");
   const [queue, setQueue] = useState<string[]>([]);
   const [queueIndex, setQueueIndex] = useState(0);
   const [expandedQueue, setExpandedQueue] = useState(false);
+  const [shuffleEnabled, setShuffleEnabled] = useState(false);
+  const [repeatMode, setRepeatModeState] = useState<RepeatMode>(RepeatMode.Off);
+  const [recommendationSeed, setRecommendationSeed] = useState(0);
+  const [refreshingHome, setRefreshingHome] = useState(false);
   const tabRef = useRef(tab);
   const playerRef = useRef(showPlayer);
+
+  useEffect(() => {
+    setConfig({
+      showNotificationsEnabled: true,
+      showCompletionNotification: true,
+      progressInterval: 1000,
+      progressMinBytes: 1024,
+      maxParallelDownloads: 2,
+    });
+  }, []);
 
   useEffect(() => {
     tabRef.current = tab;
@@ -91,14 +112,15 @@ export default function App() {
 
   const current = tracks.find((t) => t.id === currentId) ?? null;
 
+
   const localTracks = useMemo(
     () => tracks.filter((track) => track.source !== "online"),
     [tracks],
   );
 
   const likedTracks = useMemo(
-    () => localTracks.filter((track) => track.liked),
-    [localTracks],
+    () => tracks.filter((track) => track.liked),
+    [tracks],
   );
 
   const [showLikedSongs, setShowLikedSongs] = useState(false);
@@ -106,7 +128,7 @@ export default function App() {
   const libraryAlbums = useMemo(() => {
     const groups = new Map<string, AppTrack[]>();
 
-    for (const track of tracks.filter((item) => item.source !== "online")) {
+    for (const track of tracks) {
       const albumName = track.album?.trim() || "Unknown Album";
       const artistName = track.artist?.trim() || "Unknown Artist";
       const key = `${artistName.toLowerCase()}::${albumName.toLowerCase()}`;
@@ -125,6 +147,26 @@ export default function App() {
     }));
   }, [tracks]);
 
+  const songsForYou = useMemo(() => {
+    const shuffled = [...tracks];
+
+    for (let index = shuffled.length - 1; index > 0; index -= 1) {
+      const randomIndex = Math.floor(Math.random() * (index + 1));
+      [shuffled[index], shuffled[randomIndex]] = [
+        shuffled[randomIndex],
+        shuffled[index],
+      ];
+    }
+
+    return shuffled.slice(0, 8);
+  }, [tracks, recommendationSeed]);
+
+  const refreshSongsForYou = useCallback(() => {
+    setRefreshingHome(true);
+    setRecommendationSeed((previous) => previous + 1);
+    setTimeout(() => setRefreshingHome(false), 500);
+  }, []);
+
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -135,6 +177,18 @@ export default function App() {
 
     try {
       const songs = await getPublishedSongs();
+      const db = await dbPromise;
+
+      await db.execAsync(`
+        CREATE TABLE IF NOT EXISTS online_likes (
+          id TEXT PRIMARY KEY NOT NULL
+        );
+      `);
+
+      const likedRows = await db.getAllAsync<{ id: string }>(
+        "SELECT id FROM online_likes",
+      );
+      const likedOnlineIds = new Set(likedRows.map((row) => row.id));
 
       const onlineTracks: AppTrack[] = songs.map((song) => ({
         id: `online-${song.id}`,
@@ -143,7 +197,7 @@ export default function App() {
         album: song.album_name || "Single",
         uri: song.audioUrl,
         duration: song.duration_seconds ?? undefined,
-        liked: false,
+        liked: likedOnlineIds.has(`online-${song.id}`),
         addedAt: Date.now(),
         source: "online",
         artworkUri: song.artworkUrl,
@@ -197,10 +251,28 @@ export default function App() {
       },
     );
 
+    const queueSub = TrackPlayer.addEventListener(
+      Event.QueueChanged,
+      () => {
+        const nativeQueue = TrackPlayer.getQueue();
+        const nativeIds = nativeQueue
+          .map((item) => item.mediaId)
+          .filter((id): id is string => Boolean(id));
+
+        setQueue(nativeIds);
+
+        const activeIndex = TrackPlayer.getActiveMediaItemIndex();
+        if (activeIndex !== null) {
+          setQueueIndex(activeIndex);
+        }
+      },
+    );
+
     return () => {
       playingSub.remove();
       progressSub.remove();
       transitionSub.remove();
+      queueSub.remove();
     };
   }, []);
 
@@ -348,6 +420,138 @@ export default function App() {
     }
   };
 
+  const downloadOnlineTrack = async (
+    track: AppTrack,
+    addToLikedSongs = false,
+  ): Promise<AppTrack> => {
+    const db = await dbPromise;
+
+    await db.execAsync(`
+      CREATE TABLE IF NOT EXISTS online_likes (
+        id TEXT PRIMARY KEY NOT NULL
+      );
+    `);
+
+    const existing = await db.getFirstAsync<{
+      id: string;
+      title: string;
+      artist: string;
+      album: string;
+      uri: string;
+      duration: number | null;
+      liked: number;
+      addedAt: number;
+    }>(
+      "SELECT id, title, artist, album, uri, duration, liked, addedAt FROM tracks WHERE id = ?",
+      track.id,
+    );
+
+    if (existing) {
+      if (addToLikedSongs) {
+        await db.runAsync(
+          "INSERT OR IGNORE INTO online_likes (id) VALUES (?)",
+          track.id,
+        );
+        await db.runAsync(
+          "UPDATE tracks SET liked = 1 WHERE id = ?",
+          track.id,
+        );
+      }
+
+      const savedTrack: AppTrack = {
+        ...track,
+        ...existing,
+        duration: existing.duration ?? undefined,
+        liked: addToLikedSongs || Boolean(existing.liked),
+        source: "local",
+      };
+
+      setTracks((previous) => [
+        savedTrack,
+        ...previous.filter((item) => item.id !== savedTrack.id),
+      ]);
+
+      return savedTrack;
+    }
+
+    const safeId = track.id.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const destination = `${directories.documents}/music/${safeId}.mp3`;
+    const taskId = `awitify-${safeId}-${Date.now()}`;
+
+    const task = createDownloadTask({
+      id: taskId,
+      url: track.uri,
+      destination,
+      notificationTitle: track.title,
+      metadata: {
+        trackId: track.id,
+        title: track.title,
+      },
+    });
+
+    return new Promise<AppTrack>((resolve, reject) => {
+      task
+        .done(({ location }) => {
+          void (async () => {
+            try {
+              const fileUri = location.startsWith("file://")
+                ? location
+                : `file://${location}`;
+
+              if (addToLikedSongs) {
+                await db.runAsync(
+                  "INSERT OR IGNORE INTO online_likes (id) VALUES (?)",
+                  track.id,
+                );
+              }
+
+              const likedRow = await db.getFirstAsync<{ id: string }>(
+                "SELECT id FROM online_likes WHERE id = ?",
+                track.id,
+              );
+              const isLiked = Boolean(likedRow);
+
+              const savedTrack: AppTrack = {
+                ...track,
+                uri: fileUri,
+                liked: isLiked,
+                source: "local",
+              };
+
+              await db.runAsync(
+                "INSERT OR REPLACE INTO tracks (id,title,artist,album,uri,duration,liked,addedAt) VALUES (?,?,?,?,?,?,?,?)",
+                savedTrack.id,
+                savedTrack.title,
+                savedTrack.artist,
+                savedTrack.album,
+                savedTrack.uri,
+                savedTrack.duration ?? null,
+                isLiked ? 1 : 0,
+                Date.now(),
+              );
+
+              setTracks((previous) => [
+                savedTrack,
+                ...previous.filter((item) => item.id !== savedTrack.id),
+              ]);
+
+              resolve(savedTrack);
+            } catch (error) {
+              reject(error);
+            } finally {
+              void Promise.resolve(completeHandler(task.id)).catch(() => {});
+            }
+          })();
+        })
+        .error(({ error }) => {
+          void Promise.resolve(completeHandler(task.id)).catch(() => {});
+          reject(new Error(error || "Background download failed."));
+        });
+
+      task.start();
+    });
+  };
+
   const downloadSong = async (track: AppTrack) => {
     if (track.source !== "online") {
       Alert.alert(
@@ -357,64 +561,15 @@ export default function App() {
       return;
     }
 
-    setBusyMessage("Downloading song…");
+    setBusyMessage(`Downloading: ${track.title}`);
     setBusy(true);
 
     try {
-      const db = await dbPromise;
-      const id = track.id;
-      const directory = `${FileSystem.documentDirectory}music/`;
-      const dirInfo = await FileSystem.getInfoAsync(directory);
-
-      if (!dirInfo.exists) {
-        await FileSystem.makeDirectoryAsync(directory, {
-          intermediates: true,
-        });
-      }
-
-      const existing = await db.getFirstAsync<{ id: string }>(
-        "SELECT id FROM tracks WHERE id = ?",
-        id,
-      );
-
-      if (existing) {
-        Alert.alert(
-          "Already downloaded",
-          "This song is already in your offline library.",
-        );
-        return;
-      }
-
-      const destination = `${directory}${id.replace(/[^a-zA-Z0-9_-]/g, "_")}.mp3`;
-      const result = await FileSystem.downloadAsync(track.uri, destination);
-
-      const savedTrack: AppTrack = {
-        ...track,
-        uri: result.uri,
-        liked: true,
-        source: "local",
-      };
-
-      await db.runAsync(
-        "INSERT INTO tracks (id,title,artist,album,uri,duration,liked,addedAt) VALUES (?,?,?,?,?,?,?,?)",
-        savedTrack.id,
-        savedTrack.title,
-        savedTrack.artist,
-        savedTrack.album,
-        savedTrack.uri,
-        savedTrack.duration ?? null,
-        1,
-        Date.now(),
-      );
-
-      setTracks((previous) => [
-        savedTrack,
-        ...previous.filter((item) => item.id !== savedTrack.id),
-      ]);
+      const savedTrack = await downloadOnlineTrack(track);
 
       Alert.alert(
         "Downloaded",
-        `${savedTrack.title} is available offline and has been added to Liked Songs.`,
+        `${savedTrack.title} is available offline.`,
       );
     } catch (error) {
       console.error("Song download failed:", error);
@@ -424,10 +579,9 @@ export default function App() {
       );
     } finally {
       setBusy(false);
-      setBusyMessage("Importing your music…");
+      setBusyMessage("Importing your music...");
     }
   };
-
   const downloadAlbum = async (album: {
     name: string;
     artist: string;
@@ -450,23 +604,13 @@ export default function App() {
       return;
     }
 
-    setBusyMessage(`Preparing ${album.name}…`);
     setBusy(true);
-
     let downloaded = 0;
     let skipped = 0;
     let failed = 0;
 
     try {
       const db = await dbPromise;
-      const directory = `${FileSystem.documentDirectory}music/`;
-      const dirInfo = await FileSystem.getInfoAsync(directory);
-
-      if (!dirInfo.exists) {
-        await FileSystem.makeDirectoryAsync(directory, {
-          intermediates: true,
-        });
-      }
 
       for (let i = 0; i < onlineSongs.length; i++) {
         const track = onlineSongs[i];
@@ -475,48 +619,18 @@ export default function App() {
           `Downloading album: ${i + 1} of ${onlineSongs.length}\n${track.title}`,
         );
 
+        const existing = await db.getFirstAsync<{ id: string }>(
+          "SELECT id FROM tracks WHERE id = ?",
+          track.id,
+        );
+
+        if (existing) {
+          skipped++;
+          continue;
+        }
+
         try {
-          const existing = await db.getFirstAsync<{ id: string }>(
-            "SELECT id FROM tracks WHERE id = ?",
-            track.id,
-          );
-
-          if (existing) {
-            skipped++;
-            continue;
-          }
-
-          const safeId = track.id.replace(/[^a-zA-Z0-9_-]/g, "_");
-          const destination = `${directory}${safeId}.mp3`;
-          const result = await FileSystem.downloadAsync(
-            track.uri,
-            destination,
-          );
-
-          const savedTrack: AppTrack = {
-            ...track,
-            uri: result.uri,
-            liked: true,
-            source: "local",
-          };
-
-          await db.runAsync(
-            "INSERT INTO tracks (id,title,artist,album,uri,duration,liked,addedAt) VALUES (?,?,?,?,?,?,?,?)",
-            savedTrack.id,
-            savedTrack.title,
-            savedTrack.artist,
-            savedTrack.album,
-            savedTrack.uri,
-            savedTrack.duration ?? null,
-            1,
-            Date.now(),
-          );
-
-          setTracks((previous) => [
-            savedTrack,
-            ...previous.filter((item) => item.id !== savedTrack.id),
-          ]);
-
+          await downloadOnlineTrack(track, true);
           downloaded++;
         } catch (error) {
           console.error(`Failed to download ${track.title}:`, error);
@@ -536,32 +650,63 @@ export default function App() {
       );
     } finally {
       setBusy(false);
-      setBusyMessage("Importing your music…");
+      setBusyMessage("Importing your music...");
     }
   };
-
   const toggleLike = async (track: AppTrack) => {
     const liked = !track.liked;
+    const db = await dbPromise;
+
+    if (track.source === "online") {
+      await db.execAsync(`
+        CREATE TABLE IF NOT EXISTS online_likes (
+          id TEXT PRIMARY KEY NOT NULL
+        );
+      `);
+
+      if (liked) {
+        await db.runAsync(
+          "INSERT OR IGNORE INTO online_likes (id) VALUES (?)",
+          track.id,
+        );
+      } else {
+        await db.runAsync(
+          "DELETE FROM online_likes WHERE id = ?",
+          track.id,
+        );
+      }
+
+      setTracks((previous) =>
+        previous.map((item) =>
+          item.id === track.id ? { ...item, liked } : item,
+        ),
+      );
+
+      if (liked) {
+        void downloadOnlineTrack({ ...track, liked: true }).catch((error) => {
+          console.error("Automatic liked-song download failed:", error);
+          Alert.alert(
+            "Download failed",
+            `"${track.title}" is still in Liked Songs, but could not be downloaded. You can retry using Download song.`,
+          );
+        });
+      }
+
+      return;
+    }
+
+    await db.runAsync(
+      "UPDATE tracks SET liked = ? WHERE id = ?",
+      liked ? 1 : 0,
+      track.id,
+    );
 
     setTracks((previous) =>
       previous.map((item) =>
         item.id === track.id ? { ...item, liked } : item,
       ),
     );
-
-    // Local favorites persist in SQLite.
-    // Online favorites will need Supabase authentication
-    // and the favorites table integration later.
-    if (track.source === "online") return;
-
-    const db = await dbPromise;
-    await db.runAsync(
-      "UPDATE tracks SET liked = ? WHERE id = ?",
-      liked ? 1 : 0,
-      track.id,
-    );
   };
-
   const searchResults = useMemo(() => {
     const q = query.trim().toLowerCase();
 
@@ -734,10 +879,56 @@ export default function App() {
             {
               text: "Play next",
               onPress: () => {
-                const next = [...queue];
-                const at = Math.max(0, next.indexOf(currentId || ""));
-                next.splice(at + 1, 0, item.id);
-                setQueue(next);
+                if (item.id === currentId) return;
+
+                const nativeQueue = TrackPlayer.getQueue();
+                const currentIndex = nativeQueue.findIndex(
+                  (queuedItem) => queuedItem.mediaId === currentId,
+                );
+
+                if (currentIndex < 0) {
+                  console.warn("Play next skipped: current track is not in the native queue.");
+                  return;
+                }
+
+                const existingIndex = nativeQueue.findIndex(
+                  (queuedItem) => queuedItem.mediaId === item.id,
+                );
+
+                if (existingIndex === currentIndex + 1) return;
+
+                const nextQueue = [...nativeQueue];
+
+                if (existingIndex >= 0) {
+                  TrackPlayer.removeMediaItem(existingIndex);
+                  nextQueue.splice(existingIndex, 1);
+                }
+
+                const updatedCurrentIndex = nextQueue.findIndex(
+                  (queuedItem) => queuedItem.mediaId === currentId,
+                );
+
+                if (updatedCurrentIndex < 0) return;
+
+                const trackToInsert: MediaItem = {
+                  mediaId: item.id,
+                  url: item.uri,
+                  title: item.title,
+                  artist: item.artist,
+                  albumTitle: item.album || "Awitify",
+                  artworkUrl: item.artworkUri || undefined,
+                  duration: item.duration || undefined,
+                };
+
+                const insertIndex = updatedCurrentIndex + 1;
+                TrackPlayer.insertMediaItem(insertIndex, trackToInsert);
+                nextQueue.splice(insertIndex, 0, trackToInsert);
+
+                setQueue(
+                  nextQueue
+                    .map((queuedItem) => queuedItem.mediaId)
+                    .filter((id): id is string => Boolean(id)),
+                );
               },
             },
             { text: "Cancel", style: "cancel" },
@@ -788,6 +979,14 @@ export default function App() {
         <ScrollView
           showsVerticalScrollIndicator={false}
           contentContainerStyle={{ paddingBottom: 150 }}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshingHome}
+              onRefresh={refreshSongsForYou}
+              tintColor={C.blue}
+              colors={[C.blue]}
+            />
+          }
         >
           <View style={styles.topBar}>
             <View>
@@ -824,32 +1023,67 @@ export default function App() {
             </View>
           </Pressable>
           <View style={styles.sectionHead}>
-            <Text style={styles.sectionTitle}>Recently added</Text>
-            <Pressable onPress={() => setTab("Library")}>
-              <Text style={styles.link}>See all</Text>
+            <Text style={styles.sectionTitle}>Songs for You</Text>
+            <Pressable onPress={refreshSongsForYou}>
+              <Text style={styles.link}>Shuffle</Text>
             </Pressable>
           </View>
-          {tracks.length ? (
-            tracks
-              .slice(0, 5)
-              .map((t, i) => (
-                <TrackRow key={t.id} item={t} index={i} list={tracks} />
-              ))
+          {songsForYou.length > 0 ? (
+            <View style={{ paddingHorizontal: 16, gap: 8 }}>
+              {songsForYou.map((track, index) => (
+                <Pressable
+                  key={track.id}
+                  onPress={() => playTrack(track, songsForYou)}
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 12,
+                    paddingVertical: 7,
+                  }}
+                >
+                  <View
+                    style={{
+                      width: 54,
+                      height: 54,
+                      borderRadius: 6,
+                      backgroundColor: C.surface2,
+                      alignItems: "center",
+                      justifyContent: "center",
+                      overflow: "hidden",
+                    }}
+                  >
+                    {track.artworkUri ? (
+                      <Image
+                        source={{ uri: track.artworkUri }}
+                        style={{ width: "100%", height: "100%" }}
+                        resizeMode="cover"
+                      />
+                    ) : (
+                      <Ionicons name="musical-notes" size={26} color={C.blue} />
+                    )}
+                  </View>
+                  <View style={{ flex: 1, justifyContent: "center" }}>
+                    <Text numberOfLines={1} style={styles.trackTitle}>
+                      {track.title}
+                    </Text>
+                    <Text numberOfLines={1} style={styles.trackMeta}>
+                      {track.artist || "Unknown artist"} - {track.album || "Unknown album"}
+                    </Text>
+                  </View>
+                  <Ionicons
+                    name={currentId === track.id && playing ? "volume-high" : "play"}
+                    size={20}
+                    color={C.muted}
+                  />
+                </Pressable>
+              ))}
+            </View>
           ) : (
             <Empty
-              title="Your music starts here"
-              detail="Add music from your device to listen offline, or explore Awitify's online songs when you're connected."
+              title="No songs yet"
+              detail="Import music or load online songs to get recommendations here."
               action
             />
-          )}
-          {tracks.length > 0 && (
-            <Pressable
-              onPress={() => playTrack(tracks[0], tracks)}
-              style={styles.shuffleButton}
-            >
-              <Ionicons name="shuffle" size={19} color={C.white} />
-              <Text style={styles.shuffleText}>Shuffle your music</Text>
-            </Pressable>
           )}
         </ScrollView>
       );
@@ -1143,8 +1377,12 @@ export default function App() {
 
     if (tab === "Library") {
       const albumTracks = selectedAlbum
-        ? (libraryAlbums.find((album) => album.key === selectedAlbum)?.songs ??
-          [])
+        ? tracks.filter((track) => {
+            const albumName = track.album?.trim() || "Unknown Album";
+            const artistName = track.artist?.trim() || "Unknown Artist";
+            const key = `${artistName.toLowerCase()}::${albumName.toLowerCase()}`;
+            return key === selectedAlbum;
+          })
         : [];
 
       return (
@@ -1155,7 +1393,7 @@ export default function App() {
                 ? "Liked Songs"
                 : selectedAlbum
                   ? (libraryAlbums.find((album) => album.key === selectedAlbum)
-                      ?.name ?? "Album")
+                      ?.name ?? albumTracks[0]?.album?.trim() ?? "Album")
                   : "Your library"
             }
             subtitle={
@@ -1193,7 +1431,7 @@ export default function App() {
             </Pressable>
           )}
           <View style={styles.libraryActions}>
-            {selectedAlbum ? (
+            {selectedAlbum || showLikedSongs ? (
               <Pressable
                 onPress={() => {
                   setSelectedAlbum(null);
@@ -1202,7 +1440,7 @@ export default function App() {
                 style={styles.outlineButton}
               >
                 <Ionicons name="arrow-back" size={18} color={C.white} />
-                <Text style={styles.outlineText}>All albums</Text>
+                <Text style={styles.outlineText}>Back to Library</Text>
               </Pressable>
             ) : (
               <Pressable onPress={importMusic} style={styles.outlineButton}>
@@ -1232,71 +1470,139 @@ export default function App() {
 
           {showLikedSongs ? (
             <FlatList
+              key="liked-songs-grid"
               data={likedTracks}
+              numColumns={2}
               keyExtractor={(item) => item.id}
-              renderItem={({ item, index }) => (
-                <TrackRow item={item} index={index} list={likedTracks} />
+              columnWrapperStyle={{ gap: 12 }}
+              renderItem={({ item }) => (
+                <Pressable
+                  onPress={() => playTrack(item, likedTracks)}
+                  style={{
+                    width: "48%",
+                    marginBottom: 18,
+                  }}
+                >
+                  <View
+                    style={{
+                      width: "100%",
+                      aspectRatio: 1,
+                      borderRadius: 12,
+                      backgroundColor: C.surface2,
+                      alignItems: "center",
+                      justifyContent: "center",
+                      overflow: "hidden",
+                      marginBottom: 8,
+                    }}
+                  >
+                    {item.artworkUri ? (
+                      <Image
+                        source={{ uri: item.artworkUri }}
+                        style={{ width: "100%", height: "100%" }}
+                        resizeMode="cover"
+                      />
+                    ) : (
+                      <Ionicons
+                        name="musical-notes"
+                        size={42}
+                        color={C.blue}
+                      />
+                    )}
+                  </View>
+                  <Text numberOfLines={1} style={styles.trackTitle}>
+                    {item.title}
+                  </Text>
+                  <Text numberOfLines={1} style={styles.trackMeta}>
+                    {item.artist}
+                  </Text>
+                </Pressable>
               )}
-              contentContainerStyle={{ paddingBottom: 150 }}
+              contentContainerStyle={{
+                paddingHorizontal: 16,
+                paddingBottom: 150,
+              }}
               ListEmptyComponent={
                 <Empty
                   title="No liked songs yet"
-                  detail="Download an online song or tap the heart on a local song to add it here."
+                  detail="Like a local song or download an online song to save it here."
                 />
               }
             />
           ) : selectedAlbum ? (
             <FlatList
-              key="album-grid"
+              key="album-songs"
+              data={albumTracks}
+              keyExtractor={(item) => item.id}
+              renderItem={({ item, index }) => (
+                <TrackRow item={item} index={index} list={albumTracks} />
+              )}
+              contentContainerStyle={{ paddingBottom: 150 }}
+              ListEmptyComponent={
+                <Empty
+                  title="No songs in this album"
+                  detail="No local songs were found for this album."
+                />
+              }
+            />
+          ) : (
+            <FlatList
+              key="library-albums-grid"
               data={libraryAlbums}
               numColumns={2}
-              keyExtractor={(album) => album.key}
-              columnWrapperStyle={{ gap: 14 }}
-              contentContainerStyle={{ paddingBottom: 150 }}
-              renderItem={({ item: album }) => (
+              keyExtractor={(item) => item.key}
+              columnWrapperStyle={{ gap: 12 }}
+              contentContainerStyle={{
+                paddingHorizontal: 16,
+                paddingBottom: 150,
+              }}
+              renderItem={({ item }) => (
                 <Pressable
-                  onPress={() => setSelectedAlbum(album.key)}
+                  onPress={() => {
+                    setShowLikedSongs(false);
+                    setSelectedAlbum(item.key);
+                  }}
                   style={{
-                    flex: 1,
+                    width: "48%",
                     marginBottom: 20,
-                    maxWidth: "50%",
                   }}
                 >
                   <View
                     style={{
+                      width: "100%",
                       aspectRatio: 1,
-                      backgroundColor: C.surface,
-                      borderRadius: 14,
-                      overflow: "hidden",
+                      borderRadius: 12,
+                      backgroundColor: C.surface2,
                       alignItems: "center",
                       justifyContent: "center",
-                      marginBottom: 9,
+                      overflow: "hidden",
+                      marginBottom: 8,
                     }}
                   >
-                    {album.artworkUri ? (
+                    {item.artworkUri ? (
                       <Image
-                        source={{ uri: album.artworkUri }}
+                        source={{ uri: item.artworkUri }}
                         style={{ width: "100%", height: "100%" }}
                         resizeMode="cover"
                       />
                     ) : (
-                      <Ionicons name="albums" size={44} color={C.blue} />
+                      <Ionicons name="albums" size={42} color={C.blue} />
                     )}
                   </View>
                   <Text numberOfLines={1} style={styles.trackTitle}>
-                    {album.name}
+                    {item.name}
                   </Text>
                   <Text numberOfLines={1} style={styles.trackMeta}>
-                    {album.artist} · {album.songs.length} songs
+                    {item.artist} · {item.songs.length} songs
                   </Text>
                 </Pressable>
               )}
-            />
-          ) : (
-            <Empty
-              title="Your library is empty"
-              detail="Import music from your device. Songs with the same album name will be grouped together here."
-              action
+              ListEmptyComponent={
+                <Empty
+                  title="Your library is empty"
+                  detail="Import music from your device. Songs with the same album name will be grouped together here."
+                  action
+                />
+              }
             />
           )}
         </View>
@@ -1428,7 +1734,13 @@ export default function App() {
         ).map(([name, icon]) => (
           <Pressable
             key={name}
-            onPress={() => setTab(name)}
+            onPress={() => {
+              if (name === "Library") {
+                setSelectedAlbum(null);
+                setShowLikedSongs(false);
+              }
+              setTab(name);
+            }}
             style={styles.tabItem}
           >
             <Ionicons
@@ -1512,14 +1824,70 @@ export default function App() {
             </View>
           </View>
           <View style={styles.mainControls}>
-            <Pressable onPress={() => playNext(-1)}>
+            <Pressable
+              onPress={() => {
+                try {
+                  const currentMode = TrackPlayer.getRepeatMode();
+                  const nextMode =
+                    currentMode === RepeatMode.Off
+                      ? RepeatMode.All
+                      : currentMode === RepeatMode.All
+                        ? RepeatMode.One
+                        : RepeatMode.Off;
+
+                  TrackPlayer.setRepeatMode(nextMode);
+                  setRepeatModeState(nextMode);
+                } catch (error) {
+                  console.warn("Unable to update repeat mode", error);
+                }
+              }}
+              accessibilityRole="button"
+              accessibilityLabel={
+                repeatMode === RepeatMode.Off
+                  ? "Repeat off"
+                  : repeatMode === RepeatMode.All
+                    ? "Repeat all"
+                    : "Repeat one"
+              }
+            >
+              <View style={{ position: "relative" }}>
+                <Ionicons
+                  name="repeat"
+                  size={24}
+                  color={repeatMode === RepeatMode.Off ? C.muted : C.blue}
+                />
+                {repeatMode === RepeatMode.One && (
+                  <Text
+                    style={{
+                      position: "absolute",
+                      right: -5,
+                      top: -5,
+                      fontSize: 10,
+                      fontWeight: "800",
+                      color: C.blue,
+                    }}
+                  >
+                    1
+                  </Text>
+                )}
+              </View>
+            </Pressable>
+
+            <Pressable
+              onPress={() => playNext(-1)}
+              accessibilityRole="button"
+              accessibilityLabel="Previous song"
+            >
               <Ionicons name="play-skip-back" size={32} color={C.white} />
             </Pressable>
+
             <Pressable
               onPress={() =>
                 playing ? TrackPlayer.pause() : TrackPlayer.play()
               }
               style={styles.playButton}
+              accessibilityRole="button"
+              accessibilityLabel={playing ? "Pause" : "Play"}
             >
               <Ionicons
                 name={playing ? "pause" : "play"}
@@ -1527,14 +1895,42 @@ export default function App() {
                 color={C.white}
               />
             </Pressable>
-            <Pressable onPress={() => playNext(1)}>
+
+            <Pressable
+              onPress={() => playNext(1)}
+              accessibilityRole="button"
+              accessibilityLabel="Next song"
+            >
               <Ionicons name="play-skip-forward" size={32} color={C.white} />
             </Pressable>
+
+            <Pressable
+              onPress={() => {
+                const nextShuffle = !shuffleEnabled;
+
+                try {
+                  TrackPlayer.setShuffleEnabled(nextShuffle);
+                  setShuffleEnabled(nextShuffle);
+                } catch (error) {
+                  console.warn("Unable to update shuffle state", error);
+                }
+              }}
+              accessibilityRole="button"
+              accessibilityLabel={shuffleEnabled ? "Disable shuffle" : "Enable shuffle"}
+            >
+              <Ionicons
+                name="shuffle"
+                size={24}
+                color={shuffleEnabled ? C.blue : C.muted}
+              />
+            </Pressable>
           </View>
-          {expandedQueue && (
+
+                    {expandedQueue && (
             <View style={styles.queuePanel}>
               <Text style={styles.sectionTitle}>Up next</Text>
               {queue
+                .slice(queueIndex + 1)
                 .map((id) => tracks.find((t) => t.id === id))
                 .filter(Boolean)
                 .slice(0, 4)
@@ -2015,3 +2411,21 @@ const styles: any = {
     justifyContent: "center",
   },
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
